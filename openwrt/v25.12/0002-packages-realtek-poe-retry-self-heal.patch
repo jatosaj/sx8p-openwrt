@@ -1,0 +1,318 @@
+realtek-poe 1.3.2 (packages feed of OpenWrt v25.12.6): start-up retry/self-heal, serial resync, 30-poe hardening (r4: backlog 16 fixed).
+Apply in feeds/packages: git apply <this file>
+
+diff --git a/utils/realtek-poe/Makefile b/utils/realtek-poe/Makefile
+index e1dbd9a..145ecc8 100644
+--- a/utils/realtek-poe/Makefile
++++ b/utils/realtek-poe/Makefile
+@@ -4,7 +4,7 @@ include $(TOPDIR)/rules.mk
+ 
+ PKG_NAME:=realtek-poe
+ PKG_VERSION:=1.3.2
+-PKG_RELEASE:=1
++PKG_RELEASE:=4
+ PKG_LICENSE:=GPL-2.0-or-later
+ PKG_MAINTAINER:=Martin Kennedy <hurricos@gmail.com>
+ 
+diff --git a/utils/realtek-poe/files/etc/uci-defaults/30-poe b/utils/realtek-poe/files/etc/uci-defaults/30-poe
+index 3a42940..5bca19d 100644
+--- a/utils/realtek-poe/files/etc/uci-defaults/30-poe
++++ b/utils/realtek-poe/files/etc/uci-defaults/30-poe
+@@ -12,7 +12,7 @@ json_load_file "${CFG}"
+ 
+ json_is_a poe object || exit 0
+ 
+-umask 055
++umask 077
+ touch /etc/config/poe
+ 
+ json_select poe
+@@ -37,6 +37,6 @@ json_select poe
+ 	fi
+ json_select ..
+ 
+-uci commit
++uci commit poe
+ 
+ exit 0
+diff --git a/utils/realtek-poe/patches/100-retry-backoff-and-self-heal.patch b/utils/realtek-poe/patches/100-retry-backoff-and-self-heal.patch
+new file mode 100644
+index 0000000..af6b28f
+--- /dev/null
++++ b/utils/realtek-poe/patches/100-retry-backoff-and-self-heal.patch
+@@ -0,0 +1,275 @@
++realtek-poe: retry rejected commands with back-off; re-send setup when ports stay off
++
++On the Pakedge SX-8P (STM32F100 PoE MCU fw v17.1) the MCU rejects some start-up
++commands after a reboot (request-bad-checksum / not-ready). 5 retries 100 ms apart
++were not enough and ports stayed Disabled or without status until the daemon was
++restarted.
++
++- back off 0.2-12.8 s over 7 retries; a command that still fails is dropped,
++  the rest of the queue carries on (as upstream)
++- if a port that should be on has no status or reports Disabled, or one that should
++  be off reports anything else, for 15 idle polls (>= 30 s), re-send the setup with
++  ports turned off by ubus poe manage kept off;
++  give up after 3 tries until reload or until the ports stay good for 15 polls
++- resynchronise the serial input when a reply has a bad checksum (drop all
++  input, resend the command) and after a no-response timeout; before, one
++  lost byte (warm reboot mid-reply) left every later reply out of step, all
++  ports "unknown" until the daemon was restarted
++- ask for the system info again while it is missing (its reply can be lost
++  the same way; without it every per-port reply is rejected)
++- (the no-response leak fix is upstream since 1.3.2)
++
++
++
++--- a/src/main.c
+++++ b/src/main.c
++@@ -24,7 +24,13 @@
++ 
++ /* Careful with this; Only works for set_detection/disconnect_type commands. */
++ #define PORT_ID_ALL	0x7f
++-#define MAX_RETRIES	5
+++#define MAX_RETRIES	7
+++/* idle state polls (each >= 2 s) a port may disagree with its config before
+++ * setup is re-sent, and that all ports must look right before the heal
+++ * counter resets */
+++#define HEAL_TICKS	15
+++/* re-sent setups before healing gives up (until reload or the ports recover) */
+++#define HEAL_MAX	3
++ 
++ #define CMD_SIZE	12
++ #define OFFSET_CHECKSUM	(CMD_SIZE - 1)
++@@ -37,6 +43,7 @@
++ 	struct ustream_fd stream;
++ 	struct mcu_state state;
++ 	uint8_t cmd_seq;
+++	bool resyncing;
++ };
++ 
++ struct cmd {
++@@ -52,6 +59,12 @@
++ 	struct blob_buf blob_buf;
++ 	struct uloop_timeout state_timeout;
++ 	unsigned int hardcore_hacking_mode_en : 1;
+++	unsigned int heal_ticks;
+++	unsigned int good_ticks;
+++	unsigned int heal_count;
+++	unsigned int heal_gave_up : 1;
+++	/* ports switched off with "ubus call poe manage": not repaired */
+++	uint8_t admin_off[MAX_PORT];
++ };
++ 
++ static struct poe_ctx *ubus_to_poe_ctx(struct ubus_context *u)
++@@ -210,6 +223,20 @@
++ 	uci_free_context(uci);
++ }
++ 
+++/* Drop everything received so far, buffered or still in the tty. Replies are
+++ * fixed 12-byte frames read back to back; after a lost or partial byte (e.g. a
+++ * warm reboot mid-reply) every later frame is out of step until this runs. */
+++static void mcu_flush_input(struct mcu *mcu)
+++{
+++	struct ustream *s = &mcu->stream.stream;
+++	int len;
+++
+++	tcflush(mcu->stream.fd.fd, TCIFLUSH);
+++	/* the read buffer comes back one chunk at a time */
+++	while (ustream_get_read_buf(s, &len) && len > 0)
+++		ustream_consume(s, len);
+++}
+++
++ static void mcu_no_response(struct uloop_timeout *t)
++ {
++ 	struct mcu *mcu = container_of(t, struct mcu, response_timeout);
++@@ -222,6 +249,8 @@
++ 	}
++ 
++ 	ULOG_ERR("No response from PoE controller. Trying a reset\n");
+++	/* a partial frame may be sitting in the buffer: drop it */
+++	mcu_flush_input(mcu);
++ 
++ 	if (mcu->dialect.desc->ops->reset)
++ 		mcu->dialect.desc->ops->reset(mcu);
++@@ -740,6 +769,33 @@
++ 	mcu_cmd_next(mcu);
++ }
++ 
+++static void mcu_resync_done(struct uloop_timeout *t)
+++{
+++	struct mcu *mcu = container_of(t, struct mcu, error_timeout);
+++
+++	mcu_flush_input(mcu);
+++	mcu->resyncing = false;
+++	mcu_cmd_next(mcu);
+++}
+++
+++/* Bad checksum: the input is out of step. Keep the command, let the rest of the
+++ * frame arrive, drop all input, then send the command again. */
+++static void mcu_resync(struct mcu *mcu, struct cmd *cmd)
+++{
+++	if (++cmd->num_retries > MAX_RETRIES) {
+++		ULOG_ERR("Aborting request (%02x) after %d bad replies\n",
+++			 cmd->cmd[0], cmd->num_retries);
+++		free(cmd);
+++	} else {
+++		list_add(&cmd->list, &mcu->pending_cmds);
+++	}
+++	if (mcu->error_timeout.pending)
+++		uloop_timeout_cancel(&mcu->error_timeout);
+++	mcu->resyncing = true;
+++	mcu->error_timeout.cb = mcu_resync_done;
+++	uloop_timeout_set(&mcu->error_timeout, 200);
+++}
+++
++ static void handle_f0_reply(struct mcu *mcu, struct cmd *cmd, uint8_t *reply)
++ {
++ 	const char *reason;
++@@ -764,13 +820,15 @@
++ 		if (++cmd->num_retries > MAX_RETRIES) {
++ 			ULOG_ERR("Aborting request (%02x) after %d attempts\n",
++ 				 cmd->cmd[0], cmd->num_retries);
+++			/* only this command, as upstream: the rest of the queue may
+++			 * hold a port "off" that must still reach the MCU */
++ 			free(cmd);
++ 			return;
++ 		}
++ 
++-		/* Wait for the MCU to recover */
+++		/* Wait for the MCU to recover; back off: 0.2 s ... 12.8 s */
++ 		mcu->error_timeout.cb = mcu_clear_timeout;
++-		uloop_timeout_set(&mcu->error_timeout, 100);
+++		uloop_timeout_set(&mcu->error_timeout, 100 << cmd->num_retries);
++ 	}
++ 
++ 	list_add(&cmd->list, &mcu->pending_cmds);
++@@ -800,8 +858,9 @@
++ 		sum += reply[i];
++ 
++ 	if (reply[OFFSET_CHECKSUM] != sum) {
++-		ULOG_DBG("received reply with bad checksum\n");
++-		free(cmd);
+++		ULOG_WARN("Reply with bad checksum, resynchronising serial input\n");
+++		log_packet(LOG_NOTICE, "\treply: ", reply);
+++		mcu_resync(mcu, cmd);
++ 		return -1;
++ 	}
++ 
++@@ -839,6 +898,9 @@
++ 	int len;
++ 	uint8_t *reply = (uint8_t *)ustream_get_read_buf(s, &len);
++ 
+++	/* mcu_resync_done() drops whatever arrives meanwhile */
+++	if (mcu->resyncing)
+++		return;
++ 	if (len < 12)
++ 		return;
++ 	mcu_handle_reply(mcu, reply);
++@@ -981,6 +1043,72 @@
++ 	return 0;
++ }
++ 
+++/* The MCU can reject start-up commands (not ready yet) and then the ports stay
+++ * off. Re-send the setup if a port that should be on keeps reporting no status or
+++ * "Disabled", or one that should be off reports anything else; give up after
+++ * HEAL_MAX tries until the ports recover or reload.
+++ */
+++static void poe_heal_resend(struct poe_ctx *poe)
+++{
+++	/* the setup as it should be now: ports switched off with ubus stay off,
+++	 * never powered for a moment and switched off again */
+++	struct config cfg = poe->config;
+++	size_t i;
+++
+++	for (i = 0; i < cfg.port_count; i++)
+++		if (poe->admin_off[i])
+++			cfg.ports[i].enable = 0;
+++	poe_initial_setup(&poe->mcu, &cfg);
+++}
+++
+++static void poe_self_heal(struct poe_ctx *poe)
+++{
+++	const struct config *cfg = &poe->config;
+++	const struct mcu_state *state = &poe->mcu.state;
+++	bool bad = false;
+++	size_t i;
+++
+++	for (i = 0; i < cfg->port_count; i++) {
+++		const char *status = state->ports[i].status;
+++		const bool want = cfg->ports[i].enable && !poe->admin_off[i];
+++
+++		/* on but dark, or off but not "Disabled" (a lost "off") */
+++		if (want ? (!status || !strcmp(status, "Disabled"))
+++			 : (status && strcmp(status, "Disabled"))) {
+++			bad = true;
+++			break;
+++		}
+++	}
+++
+++	if (!bad) {
+++		poe->heal_ticks = 0;
+++		/* reset only after the ports stayed good, so flapping escalates */
+++		if ((poe->heal_count || poe->heal_gave_up) &&
+++		    ++poe->good_ticks >= HEAL_TICKS) {
+++			poe->good_ticks = 0;
+++			poe->heal_count = 0;
+++			poe->heal_gave_up = 0;
+++		}
+++		return;
+++	}
+++
+++	poe->good_ticks = 0;
+++	if (poe->heal_gave_up || ++poe->heal_ticks < HEAL_TICKS)
+++		return;
+++	poe->heal_ticks = 0;
+++
+++	if (poe->heal_count >= HEAL_MAX) {
+++		ULOG_ERR("PoE ports still not up after %d re-sent setups, giving up until reload\n",
+++			 HEAL_MAX);
+++		poe->heal_gave_up = 1;
+++		return;
+++	}
+++	poe->heal_count++;
+++	ULOG_WARN("PoE port state does not match config, re-sending setup (%u/%d)\n",
+++		  poe->heal_count, HEAL_MAX);
+++	poe_heal_resend(poe);
+++}
+++
++ static void state_timeout_cb(struct uloop_timeout *t)
++ {
++ 	struct poe_ctx *poe = container_of(t, struct poe_ctx, state_timeout);
++@@ -994,6 +1122,10 @@
++ 		return;
++ 	}
++ 
+++	/* the start-up system info reply can be lost (resync, no response):
+++	 * without it every per-port reply is rejected as an invalid port */
+++	if (!mcu->state.num_detected_ports)
+++		poe_cmd_status(mcu);
++ 	poe_cmd_power_stats(mcu);
++ 	if (poe->hardcore_hacking_mode_en)
++ 		poe_cmd_get_extended_config(mcu);
++@@ -1014,6 +1146,7 @@
++ 		poe_cmd_port_power_stats(mcu, i);
++ 	}
++ 
+++	poe_self_heal(poe);
++ 	uloop_timeout_set(t, 2 * 1000);
++ }
++ 
++@@ -1197,6 +1330,9 @@
++ 	struct poe_ctx *poe = ubus_to_poe_ctx(ctx);
++ 
++ 	config_load(&poe->config, 0);
+++	memset(poe->admin_off, 0, sizeof(poe->admin_off));
+++	poe->heal_ticks = poe->good_ticks = poe->heal_count = 0;
+++	poe->heal_gave_up = 0;
++ 	poe_port_setup(&poe->mcu, &poe->config);
++ 
++ 	return UBUS_STATUS_OK;
++@@ -1234,6 +1370,7 @@
++ 	if (i == cfg->port_count)
++ 		return UBUS_STATUS_OK;
++ 
+++	poe->admin_off[i] = !blobmsg_get_bool(tb[1]);
++ 	if (poe_cmd_port_enable(mcu, i, blobmsg_get_bool(tb[1])) < 0)
++ 		return UBUS_STATUS_SYSTEM_ERROR;
++ 

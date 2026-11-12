@@ -1,0 +1,307 @@
+9e8192d realtek: add support for Pakedge SX-8P
+0
+From 9e8192db98ff675bd6715201aa9f45e4dc31abc3 Mon Sep 17 00:00:00 2001
+From: jatosaj <jatosaj@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 05:53:47 +0000
+Subject: [PATCH] realtek: add support for Pakedge SX-8P
+
+The Pakedge SX-8P is an 8-port gigabit PoE+ switch with one SFP slot. The
+board is closely based on the Zyxel GS1900-10HP, without the second SFP
+cage; the SFP and reset-key GPIO pins differ and are mapped separately.
+
+Specifications:
+- SoC: Realtek RTL8380M
+- RAM: 128 MiB
+- Flash: 16 MiB SPI NOR
+- Ethernet: 8x 10/100/1000 (internal RTL8218B PHYs), lan1-lan8, all PoE
+- SFP: 1x 1000base-x (lan9)
+- PoE: ST32F100 MCU (firmware v17.1) with a BCM59111 PSE, on UART1 at
+  19200 baud (realtek,pse-mcu-gen1), 125 W budget
+- LEDs: 1x blue system LED; the front port LEDs belong to the SoC LED
+  controller and keep their U-Boot setting
+- Buttons: reset (RTL8231 GPIO)
+- Serial: console port on the rear panel, 115200 8N1
+
+Flash instructions:
+1. Dump the original flash first. The vendor firmware is not available for
+   download, so the dump is the only way back to stock.
+2. Connect the serial console and interrupt U-Boot (prompt "Pakedge#").
+3. Send the initramfs image with "loady 0x82000000" (YMODEM) and run
+   "bootm 0x82000000". This boots from RAM and writes nothing.
+4. In that system, copy the squashfs-sysupgrade image to /tmp and run
+   "sysupgrade -n /tmp/<image>". (Tested: RAM boot of the initramfs and
+   sysupgrade of this image from an existing OpenWrt installation.)
+To return to the vendor firmware, load the dumped firmware partition with
+"loady" and write it with "sf erase" / "sf write" at 0x2a0000.
+
+MAC addresses: the DTS defines none. All ports use one address, which on
+the tested unit equals the "ethaddr" of the U-Boot environment.
+
+Notes:
+- The console log level is limited to 4 in the bootargs. Printing kernel
+  messages at 115200 on ttyS0 delays the PoE MCU UART (ttyS1) enough that
+  the MCU answers with bad-checksum replies; with the kernel PSE driver
+  this shows up as "Bad message" errors on ethtool --show-pse/--set-pse
+  while the console is flooded.
+- PoE ports are disabled after boot. Enable them with
+  "ethtool --set-pse lanN c33-pse-admin-control enable" (needs ethtool-full).
+- The front PoE port LEDs are not driven by the PSE state.
+---
+ .../realtek/dts/rtl8380_pakedge_sx-8p.dts     | 223 ++++++++++++++++++
+ target/linux/realtek/image/rtl838x.mk         |  10 +
+ 2 files changed, 233 insertions(+)
+ create mode 100644 target/linux/realtek/dts/rtl8380_pakedge_sx-8p.dts
+
+diff --git a/target/linux/realtek/dts/rtl8380_pakedge_sx-8p.dts b/target/linux/realtek/dts/rtl8380_pakedge_sx-8p.dts
+new file mode 100644
+index 0000000..d15a9bd
+--- /dev/null
++++ b/target/linux/realtek/dts/rtl8380_pakedge_sx-8p.dts
+@@ -0,0 +1,223 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// Pakedge SX-8P (Netronix ODM, RTL8380M, 16 MiB SPI NOR, 8x PoE + 1x SFP).
++// Same board design as the Zyxel GS1900-10HP minus the second SFP cage. The SFP
++// cage uses the GS1900 port-9 RTL8231 pin group shifted by two (I2C 22/23,
++// MOD_DEF0 24, TX_DISABLE 21, LOS 25, all measured). TX_FAULT is not mapped:
++// pin 20 reads high while the laser works. Reset key S2 is RTL8231 pin 6
++// (the GS1900 pin 3 reads pressed here).
++
++#include "rtl838x.dtsi"
++#include "rtl8380_zyxel_gs1900_gpio.dtsi"
++
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/input/input.h>
++#include <dt-bindings/leds/common.h>
++
++/ {
++	compatible = "pakedge,sx-8p", "realtek,rtl838x-soc";
++	model = "Pakedge SX-8P";
++
++	/* Errors only on the serial console: printing info messages at 115200 blocks
++	 * interrupts long enough to split PoE MCU commands on ttyS1 (wire capture
++	 * 2026-11-06). Everything still goes to dmesg/logread. */
++	chosen {
++		bootargs = "earlycon loglevel=4";
++	};
++
++	aliases {
++		led-boot = &led_sys;
++		led-failsafe = &led_sys;
++		led-running = &led_sys;
++		led-upgrade = &led_sys;
++	};
++
++	memory@0 {
++		device_type = "memory";
++		reg = <0x0 0x8000000>;
++	};
++
++	keys {
++		compatible = "gpio-keys-polled";
++		poll-interval = <20>;
++
++		reset {
++			label = "reset";
++			gpios = <&gpio1 6 GPIO_ACTIVE_LOW>;
++			linux,code = <KEY_RESTART>;
++			debounce-interval = <100>;
++		};
++	};
++
++	leds {
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinmux_disable_sys_led>;
++		compatible = "gpio-leds";
++
++		led_sys: sys {
++			color = <LED_COLOR_ID_BLUE>;
++			function = LED_FUNCTION_STATUS;
++			gpios = <&gpio0 0 GPIO_ACTIVE_HIGH>;
++		};
++	};
++
++	/* i2c of the SFP cage: port lan9 */
++	i2c0: i2c-gpio-0 {
++		compatible = "i2c-gpio";
++		sda-gpios = <&gpio1 22 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		scl-gpios = <&gpio1 23 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		i2c-gpio,delay-us = <2>;
++		#address-cells = <1>;
++		#size-cells = <0>;
++	};
++
++	sfp0: sfp-p9 {
++		compatible = "sff,sfp";
++		i2c-bus = <&i2c0>;
++		los-gpio = <&gpio1 25 GPIO_ACTIVE_HIGH>;
++		mod-def0-gpio = <&gpio1 24 GPIO_ACTIVE_LOW>;
++		tx-disable-gpio = <&gpio1 21 GPIO_ACTIVE_HIGH>;
++		#thermal-sensor-cells = <0>;
++	};
++};
++
++&uart1 {
++	status = "okay";
++
++	/* PoE MCU (ST32F100, fw v17.1), Broadcom-PSE dialect like the GS1900-10HP */
++	pse: ethernet-pse {
++		compatible = "pakedge,sx-8p-pse", "realtek,pse-mcu-gen1";
++		current-speed = <19200>;
++
++		pse-pis {
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			PSE_PI(0)
++			PSE_PI(1)
++			PSE_PI(2)
++			PSE_PI(3)
++			PSE_PI(4)
++			PSE_PI(5)
++			PSE_PI(6)
++			PSE_PI(7)
++		};
++	};
++};
++
++&spi0 {
++	status = "okay";
++
++	flash@0 {
++		compatible = "jedec,spi-nor";
++		reg = <0>;
++		spi-max-frequency = <10000000>;
++
++		partitions {
++			compatible = "fixed-partitions";
++			#address-cells = <1>;
++			#size-cells = <1>;
++
++			partition@0 {
++				label = "u-boot";
++				reg = <0x0 0x80000>;
++				read-only;
++			};
++			partition@80000 {
++				label = "u-boot-env";
++				reg = <0x80000 0x10000>;
++				read-only;
++			};
++			partition@90000 {
++				label = "sysinfo";
++				reg = <0x90000 0x10000>;
++				read-only;
++			};
++			partition@a0000 {
++				label = "jffs2-cfg";
++				reg = <0xa0000 0x100000>;
++			};
++			partition@1a0000 {
++				label = "jffs2-log";
++				reg = <0x1a0000 0x100000>;
++			};
++			partition@2a0000 {
++				label = "firmware";
++				reg = <0x2a0000 0xd60000>;
++				compatible = "openwrt,uimage", "denx,uimage";
++				openwrt,ih-magic = <0x2a>;
++			};
++		};
++	};
++};
++
++&mdio_bus0 {
++	PHY_C22(8, 8)
++	PHY_C22(9, 9)
++	PHY_C22(10, 10)
++	PHY_C22(11, 11)
++	PHY_C22(12, 12)
++	PHY_C22(13, 13)
++	PHY_C22(14, 14)
++	PHY_C22(15, 15)
++};
++
++&switch0 {
++	ethernet-ports {
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		SWITCH_PORT(8, 1, internal)
++		SWITCH_PORT(9, 2, internal)
++		SWITCH_PORT(10, 3, internal)
++		SWITCH_PORT(11, 4, internal)
++		SWITCH_PORT(12, 5, internal)
++		SWITCH_PORT(13, 6, internal)
++		SWITCH_PORT(14, 7, internal)
++		SWITCH_PORT(15, 8, internal)
++
++		port@24 {
++			reg = <24>;
++			label = "lan9";
++			pcs-handle = <&serdes4 0>;
++			phy-mode = "1000base-x";
++			managed = "in-band-status";
++			sfp = <&sfp0>;
++		};
++
++		port@28 {
++			ethernet = <&ethernet0>;
++			reg = <28>;
++			phy-mode = "internal";
++
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
++		};
++	};
++};
++
++&thermal_zones {
++	sfp-thermal {
++		polling-delay-passive = <10000>;
++		polling-delay = <10000>;
++		thermal-sensors = <&sfp0>;
++		trips {
++			sfp-crit {
++				temperature = <110000>;
++				hysteresis = <1000>;
++				type = "critical";
++			};
++		};
++	};
++};
++
++/* Copper ports lan1..lan8 (phy8..phy15) -> MCU PoE ports 0..7 */
++&phy8  { pses = <&pse_pi0>; };
++&phy9  { pses = <&pse_pi1>; };
++&phy10 { pses = <&pse_pi2>; };
++&phy11 { pses = <&pse_pi3>; };
++&phy12 { pses = <&pse_pi4>; };
++&phy13 { pses = <&pse_pi5>; };
++&phy14 { pses = <&pse_pi6>; };
++&phy15 { pses = <&pse_pi7>; };
+diff --git a/target/linux/realtek/image/rtl838x.mk b/target/linux/realtek/image/rtl838x.mk
+index a51425b..06080eb 100644
+--- a/target/linux/realtek/image/rtl838x.mk
++++ b/target/linux/realtek/image/rtl838x.mk
+@@ -305,6 +305,16 @@ define Device/netgear_gs310tp-v1
+ endef
+ TARGET_DEVICES += netgear_gs310tp-v1
+ 
++define Device/pakedge_sx-8p
++  SOC := rtl8380
++  IMAGE_SIZE := 13696k
++  DEVICE_VENDOR := Pakedge
++  DEVICE_MODEL := SX-8P
++  DEVICE_PACKAGES += kmod-pse-realtek-mcu-uart
++  UIMAGE_MAGIC := 0x0000002a
++endef
++TARGET_DEVICES += pakedge_sx-8p
++
+ define Device/panasonic_m16eg-pn28160k
+   SOC := rtl8382
+   IMAGE_SIZE := 16384k
+-- 
+2.34.1
+

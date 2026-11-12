@@ -1,0 +1,5 @@
+# build outputs and official inputs — never commit firmware blobs or flash dumps
+*.bin
+*.dtb
+out/
+__pycache__/

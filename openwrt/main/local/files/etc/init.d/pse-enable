@@ -1,0 +1,26 @@
+#!/bin/sh /etc/rc.common
+# Local addition for OpenWrt main on the Pakedge SX-8P (not part of the upstream device patch):
+# the kernel PSE driver leaves every port disabled after boot, so switch the PoE ports on.
+# /etc/config/poe is honoured per port only as "option enable '0'" (port N = section N, lan1..lan8); nothing else in it is read.
+# stop does not disable ports: on this build `c33-pse-admin-control disable` fails with an I/O error and a kernel warning.
+
+# shellcheck disable=SC2034  # START is read by /etc/rc.common
+START=95
+
+start() {
+	# shellcheck disable=SC1091
+	. /lib/functions.sh
+	[ "$(board_name)" = "pakedge,sx-8p" ] || return 0
+	command -v ethtool >/dev/null || { logger -t pse-enable "ethtool missing"; return 1; }
+	i=0
+	while [ "$i" -lt 8 ]; do
+		port="lan$((i + 1))"
+		if [ "$(uci -q get "poe.@port[$i].enable")" = "0" ]; then
+			logger -t pse-enable "$port left disabled by /etc/config/poe"
+		else
+			ethtool --set-pse "$port" c33-pse-admin-control enable 2>/dev/null ||
+				logger -t pse-enable "enabling $port failed"
+		fi
+		i=$((i + 1))
+	done
+}

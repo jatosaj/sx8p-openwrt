@@ -1,0 +1,37 @@
+realtek-poe 1.3.2 (packages feed of OpenWrt v25.12.6) WITHOUT the retry/resync/self-heal patch - comparison build r5 (2026-11-09): kernel loglevel=4 alone. Keeps the 30-poe hardening.
+Apply in feeds/packages instead of ../0002-packages-realtek-poe-retry-self-heal.patch: git apply <this file>
+
+diff --git a/utils/realtek-poe/Makefile b/utils/realtek-poe/Makefile
+index e1dbd9a..1b1b1b2 100644
+--- a/utils/realtek-poe/Makefile
++++ b/utils/realtek-poe/Makefile
+@@ -4,7 +4,7 @@ include $(TOPDIR)/rules.mk
+ 
+ PKG_NAME:=realtek-poe
+ PKG_VERSION:=1.3.2
+-PKG_RELEASE:=1
++PKG_RELEASE:=5
+ PKG_LICENSE:=GPL-2.0-or-later
+ PKG_MAINTAINER:=Martin Kennedy <hurricos@gmail.com>
+ 
+diff --git a/utils/realtek-poe/files/etc/uci-defaults/30-poe b/utils/realtek-poe/files/etc/uci-defaults/30-poe
+index 3a42940..5bca19d 100644
+--- a/utils/realtek-poe/files/etc/uci-defaults/30-poe
++++ b/utils/realtek-poe/files/etc/uci-defaults/30-poe
+@@ -12,7 +12,7 @@ json_load_file "${CFG}"
+ 
+ json_is_a poe object || exit 0
+ 
+-umask 055
++umask 077
+ touch /etc/config/poe
+ 
+ json_select poe
+@@ -37,6 +37,6 @@ json_select poe
+ 	fi
+ json_select ..
+ 
+-uci commit
++uci commit poe
+ 
+ exit 0

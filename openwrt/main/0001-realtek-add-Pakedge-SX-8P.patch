@@ -38,26 +38,21 @@ MAC addresses: the DTS defines none. All ports use one address, which on
 the tested unit equals the "ethaddr" of the U-Boot environment.
 
 Notes:
-- The console log level is limited to 4 in the bootargs. Printing kernel
-  messages at 115200 on ttyS0 delays the PoE MCU UART (ttyS1) enough that
-  the MCU answers with bad-checksum replies; with the kernel PSE driver
-  this shows up as "Bad message" errors on ethtool --show-pse/--set-pse
-  while the console is flooded.
 - PoE ports are disabled after boot. Enable them with
   "ethtool --set-pse lanN c33-pse-admin-control enable" (needs ethtool-full).
 - The front PoE port LEDs are not driven by the PSE state.
 ---
- .../realtek/dts/rtl8380_pakedge_sx-8p.dts     | 223 ++++++++++++++++++
+ .../realtek/dts/rtl8380_pakedge_sx-8p.dts     | 220 ++++++++++++++++++
  target/linux/realtek/image/rtl838x.mk         |  10 +
- 2 files changed, 233 insertions(+)
+ 2 files changed, 230 insertions(+)
  create mode 100644 target/linux/realtek/dts/rtl8380_pakedge_sx-8p.dts
 
 diff --git a/target/linux/realtek/dts/rtl8380_pakedge_sx-8p.dts b/target/linux/realtek/dts/rtl8380_pakedge_sx-8p.dts
 new file mode 100644
-index 0000000..d15a9bd
+index 0000000..a38fcfa
 --- /dev/null
 +++ b/target/linux/realtek/dts/rtl8380_pakedge_sx-8p.dts
-@@ -0,0 +1,223 @@
+@@ -0,0 +1,220 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +// Pakedge SX-8P (Netronix ODM, RTL8380M, 16 MiB SPI NOR, 8x PoE + 1x SFP).
 +// Same board design as the Zyxel GS1900-10HP minus the second SFP cage. The SFP
@@ -77,11 +72,8 @@ index 0000000..d15a9bd
 +	compatible = "pakedge,sx-8p", "realtek,rtl838x-soc";
 +	model = "Pakedge SX-8P";
 +
-+	/* Errors only on the serial console: printing info messages at 115200 blocks
-+	 * interrupts long enough to split PoE MCU commands on ttyS1 (wire capture
-+	 * 2026-11-06). Everything still goes to dmesg/logread. */
 +	chosen {
-+		bootargs = "earlycon loglevel=4";
++		bootargs = "earlycon";
 +	};
 +
 +	aliases {

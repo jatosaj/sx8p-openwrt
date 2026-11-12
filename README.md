@@ -47,7 +47,7 @@ git clone https://github.com/jatosaj/sx8p-openwrt.git
 git clone https://git.openwrt.org/openwrt/openwrt.git -b v25.12.6 && cd openwrt
 ./scripts/feeds update -a && ./scripts/feeds install -a
 git apply ../sx8p-openwrt/openwrt/v25.12/0001-realtek-add-Pakedge-SX-8P.patch
-git -C feeds/packages apply ../../sx8p-openwrt/openwrt/v25.12/0002-packages-realtek-poe-retry-self-heal.patch
+git -C feeds/packages apply ../../../sx8p-openwrt/openwrt/v25.12/0002-packages-realtek-poe-retry-self-heal.patch
 printf 'CONFIG_TARGET_realtek=y\nCONFIG_TARGET_realtek_rtl838x=y\nCONFIG_TARGET_realtek_rtl838x_DEVICE_pakedge_sx-8p=y\n' > .config
 make defconfig && make -j"$(nproc)"
 ```

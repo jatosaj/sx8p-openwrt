@@ -15,7 +15,7 @@ needed to build and run current OpenWrt on it, plus the test rig and the results
 | OpenWrt 25.12.6 + stock realtek-poe 1.3.2 (`openwrt/v25.12/variants/`) | stock daemon | Works; drops requests under a console flood (see results) |
 | OpenWrt `main` (`openwrt/main/`) | kernel PSE driver (`realtek,pse-mcu-gen1`) | Experimental. Ports start disabled; `local/files` adds a boot script that enables them |
 
-One unit, tested over ten days at home and on a bench, with real PoE devices. Full bench report for 2026-11-12:
+One unit, tested over ten days, with real PoE devices. Full bench report for 2026-11-12:
 [`bench/results/RESULT-20261112.md`](bench/results/RESULT-20261112.md).
 Not tested: high loads (the most drawn was 4.3 W of the 125 W budget), several powered ports at once, a second unit.
 

@@ -15,8 +15,23 @@ needed to build and run current OpenWrt on it, plus the test rig and the results
 | OpenWrt 25.12.6 + stock realtek-poe 1.3.2 (`openwrt/v25.12/variants/`) | stock daemon | Works; drops requests under a console flood (see results) |
 | OpenWrt `main` (`openwrt/main/`) | kernel PSE driver (`realtek,pse-mcu-gen1`) | Experimental. Ports start disabled; `local/files` adds a boot script that enables them |
 
-Test results, one unit, one 1.6 W PoE camera: [`bench/results/RESULT-20261112.md`](bench/results/RESULT-20261112.md).
-All three passed 10 of 10 cold boots (mains cut by a smart plug) with no PoE errors.
+## Testing
+
+One unit, tested over ten days at home and on a bench, with real PoE devices. Cold boot = mains cut by a smart plug
+(10 s off); warm boot = `reboot`.
+
+| Date | Build | PoE load | Boots | Result |
+|---|---|---|---|---|
+| 2026-11-02/03 | 24.10.4, stock realtek-poe | Wi-Fi access point | 3 cold | PoE back after each boot, but after warm reboots ports stayed `unknown` until `poe restart`. That led to the retry/self-heal fix |
+| 2026-11-04 | 25.12 + realtek-poe r3 | Wi-Fi access point, 4.3 W | 10 warm + 10 cold | Pass: 0 ports `unknown`, no aborts |
+| 2026-11-06 | 25.12, wire capture on the PoE UART | | 5 warm + 5 cold | Found the split frames (see below) |
+| up to 2026-11-11 | 25.12 + realtek-poe r3 | Router powered from lan1 | warm reboots | Router came back with PoE each time |
+| 2026-11-11 | 25.12 + r4 and stock r5 | none (router moved to USB-C) | 3 warm + 3 cold each, plus console flood | Both pass boots; under the flood r5 dropped 3 requests, r4 retried them all |
+| 2026-11-12 | 25.12 + r4, 25.12 + r5, `main` | PoE camera, 1.6 W | 10 cold each | All pass, 0 PoE errors. Console flood: r4 and r5 pass |
+| 2026-11-12 | `main` without `loglevel=4` | PoE camera, 1.6 W | 10 warm + 10 cold | All pass |
+
+Full bench report for 2026-11-12: [`bench/results/RESULT-20261112.md`](bench/results/RESULT-20261112.md).
+Not tested: high loads (the most drawn was 4.3 W of the 125 W budget), several powered ports at once, a second unit.
 
 ## Hardware
 
@@ -28,16 +43,18 @@ All three passed 10 of 10 cold boots (mains cut by a smart plug) with no PoE err
 ## Build (OpenWrt 25.12.6)
 
 ```sh
+git clone https://github.com/jatosaj/sx8p-openwrt.git
 git clone https://git.openwrt.org/openwrt/openwrt.git -b v25.12.6 && cd openwrt
 ./scripts/feeds update -a && ./scripts/feeds install -a
-git apply /path/to/this/repo/openwrt/v25.12/0001-realtek-add-Pakedge-SX-8P.patch
-git -C feeds/packages apply /path/to/this/repo/openwrt/v25.12/0002-packages-realtek-poe-retry-self-heal.patch
+git apply ../sx8p-openwrt/openwrt/v25.12/0001-realtek-add-Pakedge-SX-8P.patch
+git -C feeds/packages apply ../../sx8p-openwrt/openwrt/v25.12/0002-packages-realtek-poe-retry-self-heal.patch
 printf 'CONFIG_TARGET_realtek=y\nCONFIG_TARGET_realtek_rtl838x=y\nCONFIG_TARGET_realtek_rtl838x_DEVICE_pakedge_sx-8p=y\n' > .config
 make defconfig && make -j"$(nproc)"
 ```
 
 Images land in `bin/targets/realtek/rtl838x/`: `...pakedge_sx-8p-initramfs-kernel.bin` (RAM boot) and
-`...pakedge_sx-8p-squashfs-sysupgrade.bin` (flash). OpenWrt `main`: `tools/build-main.sh OPENWRT_MAIN_CHECKOUT`.
+`...pakedge_sx-8p-squashfs-sysupgrade.bin` (flash). OpenWrt `main`: `../sx8p-openwrt/tools/build-main.sh .`
+from an OpenWrt `main` checkout with `openwrt/main/0001-realtek-add-Pakedge-SX-8P.patch` applied.
 
 ## Install
 
